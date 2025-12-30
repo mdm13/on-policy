@@ -195,6 +195,7 @@ class R_MAPPO():
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        train_info['clip_frac'] = 0
 
         for _ in range(self.ppo_epoch):
             if self._use_recurrent_policy:
@@ -214,7 +215,19 @@ class R_MAPPO():
                 train_info['dist_entropy'] += dist_entropy.item()
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
-                train_info['ratio'] += imp_weights.mean()
+                # Ratio statistics should be computed over ACTIVE samples only.
+                # Otherwise dead/inactive samples (active_mask=0) can dominate metrics
+                # and show misleading spikes without affecting gradients.
+                # 8 is the index of active_masks_batch in the sample
+                active_masks_batch = check(sample[8]).to(**self.tpdv)
+                denom = active_masks_batch.sum() + 1e-8
+                ratio_active = (imp_weights * active_masks_batch).sum() / denom
+                train_info['ratio'] += ratio_active.item()
+
+                # PPO clip fraction over active samples (useful diagnostic)
+                clipped = (torch.abs(imp_weights - 1.0) > self.clip_param).float()
+                clip_frac = (clipped * active_masks_batch).sum() / denom
+                train_info['clip_frac'] += clip_frac.item()   #fraction of active samples where the ratio is clipped
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
