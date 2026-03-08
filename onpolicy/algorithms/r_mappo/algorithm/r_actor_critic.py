@@ -70,6 +70,31 @@ class R_Actor(nn.Module):
 
         return actions, action_log_probs, rnn_states
 
+    def get_logit_forward(self, obs, rnn_states, masks, available_actions=None):
+        """
+        Forward pass returning the action distribution (for distillation).
+        Returns a FixedCategorical whose .logits attribute gives raw logits.
+
+        :param obs: (np.ndarray / torch.Tensor) observation inputs.
+        :param rnn_states: (np.ndarray / torch.Tensor) RNN hidden states.
+        :param masks: (np.ndarray / torch.Tensor) mask tensor for RNN resets.
+        :param available_actions: (np.ndarray / torch.Tensor) available action mask.
+
+        :return: FixedCategorical distribution.
+        """
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        actor_features = self.base(obs)
+
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+
+        return self.act.get_logits(actor_features, available_actions)
+
     def evaluate_actions(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
         """
         Compute log probability and entropy of given actions.

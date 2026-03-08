@@ -112,6 +112,26 @@ class ACTLayer(nn.Module):
         
         return action_probs
 
+    def get_logits(self, x, available_actions=None):
+        """
+        Return the action distribution (FixedCategorical) without sampling.
+        Used for knowledge distillation to compare teacher/student distributions.
+
+        :param x: (torch.Tensor) input to network.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+                                  (if None, all actions available)
+
+        :return: FixedCategorical distribution whose .logits give raw (masked) logits.
+        """
+        if self.mixed_action or self.multi_discrete:
+            logits_list = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                logits_list.append(action_logit.logits)
+            return FixedCategorical(logits=torch.cat(logits_list, -1))
+        else:
+            return self.action_out(x, available_actions)
+
     def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
         """
         Compute log probability and entropy of given actions.
