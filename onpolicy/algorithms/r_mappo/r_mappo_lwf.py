@@ -83,9 +83,15 @@ class R_MAPPO_LwF(R_MAPPO):
             # Scale by T² to maintain gradient magnitude
             return (T * T) * kl.mean()
         else:
-            # L2 loss on logits (default)
-            diff = teacher_logits - student_logits
-            return torch.sum(diff ** 2, dim=-1, keepdim=True).mean()
+            # L2 loss on mean-centered logits (default)
+            # Center logits so L2 matches the large-T limit of T²·KL
+            # (softmax is shift-invariant, so raw L2 has a spurious gradient
+            #  component that pushes logits toward matching the teacher's mean)
+            teacher_centered = teacher_logits - teacher_logits.mean(dim=-1, keepdim=True)
+            student_centered = student_logits - student_logits.mean(dim=-1, keepdim=True)
+            diff = teacher_centered - student_centered
+            N = teacher_logits.shape[-1]
+            return (1.0 / (2.0 * N)) * torch.sum(diff ** 2, dim=-1, keepdim=True).mean()
 
     def ppo_update(self, sample, update_actor=True):
         """
