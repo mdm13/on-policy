@@ -21,17 +21,25 @@ class R_MAPPO_LwF(R_MAPPO):
     """
 
     def __init__(self, args, policy, device=torch.device("cpu"),
-                 lwf_alpha=0.01, lwf_loss_type="l2", lwf_temperature=1.0):
+                 lwf_alpha=0.01, lwf_loss_type="l2", lwf_temperature=1.0,
+                 track_logits=False):
         super().__init__(args, policy, device=device)
         self.lwf_alpha = lwf_alpha
         self.lwf_loss_type = lwf_loss_type
         self.lwf_temperature = lwf_temperature
         self.teacher_trainer = None
+        self.track_logits = track_logits
 
         # Track distillation-specific metrics
         self.last_ppo_loss = 0.0
         self.last_distillation_loss = 0.0
         self.last_total_policy_loss = 0.0
+
+        # Per-action logit tracking (populated when track_logits=True)
+        self.last_teacher_logit_mean = None  # shape: (n_actions,)
+        self.last_teacher_logit_std = None
+        self.last_student_logit_mean = None
+        self.last_student_logit_std = None
 
     def set_teacher(self, teacher_trainer):
         """
@@ -69,9 +77,30 @@ class R_MAPPO_LwF(R_MAPPO):
             )
             teacher_logits = teacher_dist.logits
 
+        # Action availability mask: (batch, n_actions), True = available
+        if available_actions_batch is not None:
+            avail = check(available_actions_batch).to(**self.tpdv).bool()
+        else:
+            avail = torch.ones_like(teacher_logits, dtype=torch.bool)
+
+        if self.track_logits:
+            with torch.no_grad():
+                # Per-action mean and std across batch, only over available observations
+                counts = avail.sum(dim=0).float().clamp(min=1)
+                t_masked = teacher_logits * avail
+                s_masked = student_logits * avail
+                t_mean = t_masked.sum(dim=0) / counts
+                s_mean = s_masked.sum(dim=0) / counts
+                t_var = ((teacher_logits - t_mean.unsqueeze(0)) ** 2 * avail).sum(dim=0) / counts
+                s_var = ((student_logits - s_mean.unsqueeze(0)) ** 2 * avail).sum(dim=0) / counts
+                self.last_teacher_logit_mean = t_mean.cpu()
+                self.last_teacher_logit_std = t_var.sqrt().cpu()
+                self.last_student_logit_mean = s_mean.cpu()
+                self.last_student_logit_std = s_var.sqrt().cpu()
+
         if self.lwf_loss_type == "kl":
             # KL divergence: KL(teacher || student)
-            # Divide logits by temperature to soften distributions (Hinton et al., 2015)
+            # Masked actions have softmax ≈ 0, so they contribute nothing.
             T = self.lwf_temperature
             teacher_log_probs = torch.log_softmax(teacher_logits / T, dim=-1)
             student_log_probs = torch.log_softmax(student_logits / T, dim=-1)
@@ -84,14 +113,18 @@ class R_MAPPO_LwF(R_MAPPO):
             return (T * T) * kl.mean()
         else:
             # L2 loss on mean-centered logits (default)
-            # Center logits so L2 matches the large-T limit of T²·KL
-            # (softmax is shift-invariant, so raw L2 has a spurious gradient
-            #  component that pushes logits toward matching the teacher's mean)
-            teacher_centered = teacher_logits - teacher_logits.mean(dim=-1, keepdim=True)
-            student_centered = student_logits - student_logits.mean(dim=-1, keepdim=True)
+            # Center and normalize only over available actions so that L2
+            # matches the large-T limit of T²·KL (which naturally ignores
+            # masked actions via zero softmax probability).
+            avail_f = avail.float()
+            n_avail = avail_f.sum(dim=-1, keepdim=True).clamp(min=1)
+            # Mean over available actions only
+            teacher_mean = (teacher_logits * avail_f).sum(dim=-1, keepdim=True) / n_avail
+            student_mean = (student_logits * avail_f).sum(dim=-1, keepdim=True) / n_avail
+            teacher_centered = (teacher_logits - teacher_mean) * avail_f
+            student_centered = (student_logits - student_mean) * avail_f
             diff = teacher_centered - student_centered
-            N = teacher_logits.shape[-1]
-            return (1.0 / (2.0 * N)) * torch.sum(diff ** 2, dim=-1, keepdim=True).mean()
+            return (0.5 / n_avail * torch.sum(diff ** 2, dim=-1, keepdim=True)).mean()
 
     def ppo_update(self, sample, update_actor=True):
         """
@@ -207,6 +240,15 @@ class R_MAPPO_LwF(R_MAPPO):
         train_info['distillation_loss'] = 0
         train_info['total_policy_loss'] = 0
 
+        # Accumulators for per-action logit tracking
+        if self.track_logits:
+            logit_accum = {
+                'teacher_logit_mean': None,
+                'teacher_logit_std': None,
+                'student_logit_mean': None,
+                'student_logit_std': None,
+            }
+
         for _ in range(self.ppo_epoch):
             if self._use_recurrent_policy:
                 data_generator = buffer.recurrent_generator(advantages, self.num_mini_batch, self.data_chunk_length)
@@ -239,9 +281,33 @@ class R_MAPPO_LwF(R_MAPPO):
                 train_info['distillation_loss'] += self.last_distillation_loss
                 train_info['total_policy_loss'] += self.last_total_policy_loss
 
+                # Accumulate per-action logit stats
+                if self.track_logits and self.last_teacher_logit_mean is not None:
+                    for key, attr in [
+                        ('teacher_logit_mean', self.last_teacher_logit_mean),
+                        ('teacher_logit_std', self.last_teacher_logit_std),
+                        ('student_logit_mean', self.last_student_logit_mean),
+                        ('student_logit_std', self.last_student_logit_std),
+                    ]:
+                        if logit_accum[key] is None:
+                            logit_accum[key] = attr.clone()
+                        else:
+                            logit_accum[key] += attr
+
         num_updates = self.ppo_epoch * self.num_mini_batch
 
         for k in train_info.keys():
             train_info[k] /= num_updates
+
+        # Average and unpack per-action logit stats into train_info
+        if self.track_logits and logit_accum['teacher_logit_mean'] is not None:
+            n_actions = logit_accum['teacher_logit_mean'].shape[0]
+            for key in logit_accum:
+                logit_accum[key] /= num_updates
+            for a in range(n_actions):
+                train_info[f'teacher_logit_mean_action_{a}'] = logit_accum['teacher_logit_mean'][a].item()
+                train_info[f'teacher_logit_std_action_{a}'] = logit_accum['teacher_logit_std'][a].item()
+                train_info[f'student_logit_mean_action_{a}'] = logit_accum['student_logit_mean'][a].item()
+                train_info[f'student_logit_std_action_{a}'] = logit_accum['student_logit_std'][a].item()
 
         return train_info
